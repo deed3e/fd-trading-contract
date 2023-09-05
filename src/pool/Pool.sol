@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: UNLICENSED
-
 pragma solidity >=0.8.19;
 
 import {Ownable} from "openzeppelin/access/Ownable.sol";
@@ -17,87 +16,41 @@ uint256 constant ORACLE_DECIMAL = 1e18;
 uint256 constant LP_DECIMAL = 1e18;
 uint256 constant PRECISION = 1e10;
 uint256 constant INIT_LP = 100 * LP_DECIMAL;
+address constant ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
 struct AssetInfo {
     uint256 feeReserve;
     bool isStableCoin;
 }
 
-struct Position {
-    uint256 size;
-    uint256 collateralValue;
-    uint256 reserveAmount;
-    uint256 entryPrice;
-}
-
-struct IncreasePositionVars {
-    uint256 reserveAdded;
-    uint256 collateralAmount;
-    uint256 collateralValueAdded;
-    uint256 feeValue;
-    uint256 daoFee;
-    uint256 indexPrice;
-    uint256 sizeChanged;
-    uint256 feeAmount;
-    uint256 totalLpFee;
-}
-
-struct DecreasePositionVars {
-    uint256 collateralReduced;
-    uint256 sizeChanged;
-    uint256 indexPrice;
-    uint256 collateralPrice;
-    uint256 remainingCollateral;
-    /// @notice reserve reduced due to reducion process
-    uint256 reserveReduced;
-    /// @notice total value of fee to be collect (include dao fee and LP fee)
-    uint256 feeValue;
-    /// @notice amount of collateral taken as fee
-    uint256 daoFee;
-    /// @notice real transfer out amount to user
-    uint256 payout;
-    /// @notice 'net' PnL (fee not counted)
-    int256 pnl;
-    int256 poolAmountReduced;
-    uint256 totalLpFee;
-}
-
 struct Fee {
-    uint256 swapFee;
+    uint256 baseSwapFee;
     uint256 positionFee;
     uint256 liquidationFee;
     uint256 borrowFee;
 }
 
-contract Pool is Ownable, IPool {
+contract Pool is Ownable {
     using SignedIntOps for int256;
     using SafeCast for uint256;
 
     /* =========== Statement  ======== */
-    address public orderManager;
     Fee public fee;
     IOracle public oracle;
     mapping(address => AssetInfo) public poolAssets;
     address[] public allAssets;
     mapping(address => bool) public isAsset;
+    mapping(address => bool) public isListed;
     ILPToken public lpToken;
-    uint256 public maxLeverage;
-    mapping(bytes32 => Position) public positions;
 
     /* =========== MODIFIERS ========== */
     constructor(address _oracle) {
         oracle = IOracle(_oracle);
-        fee.liquidationFee = 5e3;
-    }
-
-    modifier onlyOrderManager() {
-        _requireOrderManager();
-        _;
     }
 
     modifier onlyAsset(address _token) {
         if (!isAsset[_token]) {
-            revert AssetNotListed(_token);
+            revert NotAsset(_token);
         }
         _;
     }
@@ -111,7 +64,6 @@ contract Pool is Ownable, IPool {
     }
 
     // ========= View functions =========
-
     function getVirtualPoolValue() external view returns (uint256) {
         return _getPoolValue();
     }
@@ -183,97 +135,9 @@ contract Pool is Ownable, IPool {
         emit Swap(_to, _tokenIn, _tokenOut, _amountIn, amountOut, 0);
     }
 
-    function increasePosition(
-        address _account,
-        address _indexToken,
-        address _collateralToken,
-        uint256 _collateral,
-        uint256 _sizeChanged,
-        Side _side
-    ) external onlyAsset(_indexToken) onlyAsset(_collateralToken) onlyOrderManager {
-        IncreasePositionVars memory vars;
-        vars.collateralAmount = _collateral;
-        bytes32 key = _getPositionKey(_account, _indexToken, _collateralToken, _side);
-        Position memory position = positions[key];
-        uint256 collateralPrice = oracle.getPrice(_collateralToken);
-        uint256 indexPrice = oracle.getPrice(_indexToken);
-        vars.collateralValueAdded = collateralPrice * _collateral;
-        vars.indexPrice = indexPrice;
-        vars.sizeChanged = _sizeChanged;
-        vars.reserveAdded = vars.sizeChanged / collateralPrice;
-
-        position.entryPrice = PositionUtils.calcAveragePrice(
-            _side, position.size, position.size + vars.sizeChanged, position.entryPrice, vars.indexPrice, 0
-        );
-        position.collateralValue =
-            MathUtils.zeroCapSub(position.collateralValue + vars.collateralValueAdded, vars.feeValue);
-        position.size += vars.sizeChanged;
-        position.reserveAmount += vars.reserveAdded;
-
-        _validatePosition(position, true);
-        positions[key] = position;
-    }
-
-    function decreasePosition(
-        address _owner,
-        address _indexToken,
-        address _collateralToken,
-        uint256 _collateralChanged,
-        uint256 _sizeChanged,
-        Side _side,
-        address _receiver
-    ) external onlyAsset(_indexToken) onlyAsset(_collateralToken) onlyOrderManager {
-        bytes32 key = _getPositionKey(_owner, _indexToken, _collateralToken, _side);
-        Position memory position = positions[key];
-
-        if (position.size == 0) {
-            revert PositionNotExists(_owner, _indexToken, _collateralToken, _side);
-        }
-
-        DecreasePositionVars memory vars =
-            _calcDecreasePayout(position, _indexToken, _collateralToken, _side, _sizeChanged, _collateralChanged, false);
-
-        // reset to actual reduced value instead of user input
-        vars.collateralReduced = position.collateralValue - vars.remainingCollateral;
-        position.size = position.size - vars.sizeChanged;
-        position.reserveAmount = position.reserveAmount - vars.reserveReduced;
-        position.collateralValue = vars.remainingCollateral;
-
-        _validatePosition(position, false);
-        if (position.size == 0) {
-            delete positions[key];
-        } else {
-            positions[key] = position;
-        }
-
-        IERC20(_collateralToken).transfer(_receiver, vars.payout);
-    }
-
-    function liquidatePosition(address _account, address _indexToken, address _collateralToken, Side _side)
-        external
-        onlyAsset(_indexToken)
-        onlyAsset(_collateralToken)
-    {
-        bytes32 key = _getPositionKey(_account, _indexToken, _collateralToken, _side);
-        Position memory position = positions[key];
-        // uint256 markPrice = oracle.getPrice(_indexToken);
-        // if (!_liquidatePositionAllowed(position, _side, markPrice)) {
-        //     revert PositionNotLiquidated(key);
-        // }
-        DecreasePositionVars memory vars = _calcDecreasePayout(
-            position, _indexToken, _collateralToken, _side, position.size, position.collateralValue, true
-        );
-
-        // ...emit
-        delete positions[key];
-        _doTransferOut(_collateralToken, _account, vars.payout);
-        _doTransferOut(_collateralToken, msg.sender, fee.liquidationFee / vars.collateralPrice);
-    }
-
     // ========= Admin functions ========
-
-    function setMaxLeverage(uint256 _maxLeverage) external onlyOwner {
-        _setMaxLeverage(_maxLeverage);
+    function withdrawETH() external onlyOwner {
+        
     }
 
     function setFee(Fee memory _fee) external onlyOwner {
@@ -285,6 +149,9 @@ contract Pool is Ownable, IPool {
     }
 
     function addToken(address _token, bool _isStableCoin, uint256 _feeReserve) external onlyOwner {
+         if (isListed[_token]) {
+            revert DuplicateToken(_token);
+        }
         _requireAddress(_token);
         AssetInfo memory assetInfo;
         assetInfo.isStableCoin = _isStableCoin;
@@ -292,6 +159,7 @@ contract Pool is Ownable, IPool {
         poolAssets[_token] = assetInfo;
         allAssets.push(_token);
         isAsset[_token] = true;
+        isListed[_token] = true;
         emit AddPoolToken(_token);
     }
 
@@ -300,12 +168,6 @@ contract Pool is Ownable, IPool {
         IOracle oldOracle = IOracle(address(oracle));
         oracle = IOracle(_oracle);
         emit OracleChange(address(oldOracle), address(oracle));
-    }
-
-    function setOrderManager(address _orderManager) external onlyOwner {
-        _requireAddress(_orderManager);
-        orderManager = _orderManager;
-        emit SetOrderManager(_orderManager);
     }
 
     // ======== Internal functions =========
@@ -350,118 +212,10 @@ contract Pool is Ownable, IPool {
         outAmount = (_lpAmount * poolValue) / totalLp / priceToken;
     }
 
-    function _setMaxLeverage(uint256 _maxLeverage) internal {
-        if (_maxLeverage == 0) {
-            revert InvalidMaxLeverage();
-        }
-        maxLeverage = _maxLeverage;
-        emit MaxLeverageChanged(_maxLeverage);
-    }
-
-    function _getPositionKey(address _owner, address _indexToken, address _collateralToken, Side _side)
-        internal
-        pure
-        returns (bytes32)
-    {
-        return keccak256(abi.encode(_owner, _indexToken, _collateralToken, _side));
-    }
-
     function _requireAddress(address _address) internal pure {
         if (_address == address(0)) {
             revert ZeroAddress();
         }
-    }
-
-    function _requireOrderManager() internal view {
-        if (msg.sender != orderManager) {
-            revert OrderManagerOnly();
-        }
-    }
-
-    function _validatePosition(Position memory _position, bool _isIncrease) internal view {
-        if ((_isIncrease && _position.size == 0)) {
-            revert InvalidPositionSize();
-        }
-
-        if (_position.size < _position.collateralValue || _position.size > _position.collateralValue * maxLeverage) {
-            revert InvalidLeverage(_position.size, _position.collateralValue, maxLeverage);
-        }
-    }
-
-    // need refactor
-    function _calcDecreasePayout(
-        Position memory _position,
-        address _indexToken,
-        address _collateralToken,
-        Side _side,
-        uint256 _sizeChanged,
-        uint256 _collateralChanged,
-        bool isLiquidate
-    ) internal view returns (DecreasePositionVars memory vars) {
-        // clean user input
-        vars.sizeChanged = MathUtils.min(_position.size, _sizeChanged);
-        vars.collateralReduced = _position.collateralValue < _collateralChanged || _position.size == vars.sizeChanged
-            ? _position.collateralValue
-            : _collateralChanged;
-
-        vars.indexPrice = oracle.getPrice(_indexToken);
-        vars.collateralPrice = oracle.getPrice(_collateralToken);
-
-        // vars is santinized, only trust these value from now on
-        vars.reserveReduced = (_position.reserveAmount * vars.sizeChanged) / _position.size;
-        vars.pnl = PositionUtils.calcPnl(_side, vars.sizeChanged, _position.entryPrice, vars.indexPrice);
-
-        // first try to deduct fee and lost (if any) from withdrawn collateral
-        int256 payoutValue = vars.pnl + vars.collateralReduced.toInt256() - vars.feeValue.toInt256();
-        if (isLiquidate) {
-            payoutValue = payoutValue - fee.liquidationFee.toInt256();
-        }
-        int256 remainingCollateral = (_position.collateralValue - vars.collateralReduced).toInt256(); // subtraction never overflow, checked above
-        // if the deduction is too much, try to deduct from remaining collateral
-        if (payoutValue < 0) {
-            remainingCollateral = remainingCollateral + payoutValue;
-            payoutValue = 0;
-        }
-        int256 collateralPrice = vars.collateralPrice.toInt256();
-        vars.payout = uint256(payoutValue / collateralPrice);
-        int256 poolValueReduced = vars.pnl;
-        if (remainingCollateral < 0) {
-            if (!isLiquidate) {
-                revert UpdateCauseLiquidation();
-            }
-            // if liquidate too slow, pool must take the lost
-            poolValueReduced = poolValueReduced - remainingCollateral;
-            vars.remainingCollateral = 0;
-        } else {
-            vars.remainingCollateral = uint256(remainingCollateral);
-        }
-
-        if (_side == Side.LONG) {
-            poolValueReduced = poolValueReduced + vars.collateralReduced.toInt256();
-        } else if (poolValueReduced < 0) {
-            // in case of SHORT, trader can lost unlimited value but pool can only increase at most collateralValue - liquidationFee
-            poolValueReduced = poolValueReduced.cap(
-                MathUtils.zeroCapSub(_position.collateralValue, vars.feeValue + fee.liquidationFee)
-            );
-        }
-        vars.poolAmountReduced = poolValueReduced / collateralPrice;
-    }
-
-    function _liquidatePositionAllowed(Position memory _position, Side _side, uint256 _indexPrice)
-        internal
-        view
-        returns (bool)
-    {
-        if (_position.size == 0) {
-            return false;
-        }
-        // calculate fee needed when close position
-        uint256 feeValue = _calcPositionFee();
-        int256 pnl = PositionUtils.calcPnl(_side, _position.size, _position.entryPrice, _indexPrice);
-        int256 collateral = pnl + _position.collateralValue.toInt256();
-
-        // liquidation occur when collateral cannot cover margin fee
-        return collateral < 0 || uint256(collateral) < (feeValue + fee.liquidationFee);
     }
 
     function _doTransferOut(address _token, address _to, uint256 _amount) internal {
@@ -469,12 +223,6 @@ contract Pool is Ownable, IPool {
             IERC20 token = IERC20(_token);
             token.transfer(_to, _amount);
         }
-    }
-
-    function _calcPositionFee() internal pure returns (uint256 feeValue) {
-        uint256 borrowFee = 0;
-        uint256 positionFee = 0;
-        feeValue = borrowFee + positionFee;
     }
 
     // ========= Event ===============
@@ -490,7 +238,7 @@ contract Pool is Ownable, IPool {
     );
 
     // ========= Error ===============
-    error AssetNotListed(address token);
+    error NotAsset(address token);
     error InsufficientPoolAmount(address token);
     error ZeroAddress();
     error SameTokenSwap(address token);
@@ -503,4 +251,5 @@ contract Pool is Ownable, IPool {
     error UpdateCauseLiquidation();
     error ZeroAmount();
     error PositionNotLiquidated(bytes32 key);
+    error DuplicateToken(address token);
 }

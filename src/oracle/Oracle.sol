@@ -7,7 +7,7 @@ import {IOracle} from "../interfaces/IOracle.sol";
 
 /// @title PriceFeed
 /// @notice Price feed with guard from
-contract OracleV2 is Ownable,IOracle {
+contract Oracle is Ownable, IOracle {
     mapping(address => uint256) public lastAnswers;
     mapping(address => uint256) public lastAnswerTimestamp;
     mapping(address => uint256) public lastAnswerBlock;
@@ -48,8 +48,8 @@ contract OracleV2 is Ownable,IOracle {
         return _getPrice(token);
     }
 
-    function getLastPrice(address token) external view returns (uint256 lastPrice) {
-        (lastPrice,) = _getLastPrice(token);
+    function getLastPrice(address token) external view returns (uint256 lastPrice, uint256 timestamp) {
+        (lastPrice, timestamp) = _getLastPrice(token);
     }
 
     // =========== Restrited functions ===========
