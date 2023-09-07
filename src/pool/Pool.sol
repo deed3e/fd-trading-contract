@@ -5,43 +5,52 @@ import {Ownable} from "openzeppelin/access/Ownable.sol";
 import {IERC20} from "openzeppelin/interfaces/IERC20.sol";
 import {MathUtils} from "../lib/MathUtils.sol";
 import {IOracle} from "../interfaces/IOracle.sol";
-import {IPool, Side} from "../interfaces/IPool.sol";
 import {ILPToken} from "../interfaces/ILPToken.sol";
 import {SafeCast} from "openzeppelin/utils/math/SafeCast.sol";
-import {PositionUtils} from "../lib/PositionUtils.sol";
 import {SignedIntOps} from "../lib/SignedInt.sol";
-import {Test, console} from "forge-std/Test.sol";
+import {IPool} from "../interfaces/IPool.sol";
 
-uint256 constant ORACLE_DECIMAL = 1e18;
-uint256 constant LP_DECIMAL = 1e18;
+uint256 constant ORACLE_DECIMAL = 1e8;
 uint256 constant PRECISION = 1e10;
-uint256 constant INIT_LP = 100 * LP_DECIMAL;
-address constant ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+uint256 constant LP_INITIAL_PRICE = 1e12; // // fix to 1$
+uint256 constant MAX_BASE_SWAP_FEE = 1e8; // 1%
+uint256 constant MAX_ASSETS = 10;
+uint256 constant TIME_OUT_ORACLE = 1 minutes;
+
+struct TokenWeight {
+    address token;
+    uint256 weight;
+}
 
 struct AssetInfo {
     uint256 feeReserve;
-    bool isStableCoin;
+    uint256 borrowIndex;
 }
 
 struct Fee {
     uint256 baseSwapFee;
-    uint256 positionFee;
-    uint256 liquidationFee;
-    uint256 borrowFee;
+    uint256 baseAddRemoveLiquidityFee;
+    uint256 taxBasisPoint;
+    uint256 stableCoinBaseSwapFee;
+    uint256 stableCoinTaxBasisPoint;
+    uint256 devFee;
 }
 
-contract Pool is Ownable {
+contract Pool is Ownable, IPool {
     using SignedIntOps for int256;
     using SafeCast for uint256;
 
     /* =========== Statement  ======== */
     Fee public fee;
     IOracle public oracle;
-    mapping(address => AssetInfo) public poolAssets;
     address[] public allAssets;
+    mapping(address => AssetInfo) public poolAssets;
     mapping(address => bool) public isAsset;
     mapping(address => bool) public isListed;
+    mapping(address => bool) public isStableCoin;
+    mapping(address => uint256) public targetWeights;
     ILPToken public lpToken;
+    uint256 public totalWeight;
 
     /* =========== MODIFIERS ========== */
     constructor(address _oracle) {
@@ -55,23 +64,30 @@ contract Pool is Ownable {
         _;
     }
 
+    modifier onlyListed(address _token) {
+        if (!isListed[_token]) {
+            revert NotListed(_token);
+        }
+        _;
+    }
+
     modifier sureEnoughBalance(address _token, uint256 _minAmount) {
         IERC20 token = IERC20(_token);
-        if (token.balanceOf(address(this)) < _minAmount) {
+        if (token.balanceOf(address(this)) - poolAssets[_token].feeReserve < _minAmount) {
             revert InsufficientPoolAmount(_token);
         }
         _;
     }
 
     // ========= View functions =========
-    function getVirtualPoolValue() external view returns (uint256) {
+    function getPoolValue() external view returns (uint256) {
         return _getPoolValue();
     }
 
     function calcSwapOutput(address _tokenIn, address _tokenOut, uint256 _amountIn)
         external
         view
-        returns (uint256 amountOut)
+        returns (uint256 amountOutAfterFee, uint256 feeAmount)
     {
         return _calcSwapOutput(_tokenIn, _tokenOut, _amountIn);
     }
@@ -86,16 +102,21 @@ contract Pool is Ownable {
         onlyAsset(_token)
     {
         uint256 totalPoolValue = _getPoolValue();
-        IERC20(_token).transferFrom(_to, address(this), _amountIn);
+        IERC20(_token).transferFrom(msg.sender, address(this), _amountIn);
         uint256 priceToken = oracle.getPrice(_token);
         uint256 totalLP = lpToken.totalSupply();
         uint256 lpAmount;
+        uint256 valueChange = _amountIn * priceToken;
+        uint256 _fee =
+            _calcFeeRate(_token, priceToken, valueChange, fee.baseAddRemoveLiquidityFee, fee.taxBasisPoint, true);
+        uint256 userAmount = MathUtils.frac(_amountIn, PRECISION - _fee, PRECISION);
+        (uint256 devFee,) = _calcDevFee(_amountIn - userAmount);
+        poolAssets[_token].feeReserve += devFee;
         if (totalLP > 0) {
-            lpAmount = _amountIn * priceToken * totalLP / totalPoolValue;
+            lpAmount = MathUtils.frac(userAmount * priceToken, totalLP, totalPoolValue);
         } else {
-            lpAmount = INIT_LP;
+            lpAmount = MathUtils.frac(userAmount, priceToken, LP_INITIAL_PRICE);
         }
-
         if (lpAmount < _minLpAmount) {
             revert SlippageExceeded();
         }
@@ -112,8 +133,8 @@ contract Pool is Ownable {
         if (outAmount < _minOut) {
             revert SlippageExceeded();
         }
-        lpToken.burnFrom(_to, _lpAmount);
-        IERC20(_tokenOut).transfer(_to, outAmount);
+        lpToken.burnFrom(msg.sender, _lpAmount);
+        _doTransferOut(_tokenOut, _to, outAmount);
         emit RemoveLiquidity(_to, outAmount);
     }
 
@@ -121,25 +142,22 @@ contract Pool is Ownable {
         external
         sureEnoughBalance(_tokenOut, _minOut)
         onlyAsset(_tokenOut)
-        onlyAsset(_tokenIn)
+        onlyListed(_tokenIn)
     {
-        IERC20 tokenOut = IERC20(_tokenOut);
         if (_tokenIn == _tokenOut) {
             revert SameTokenSwap(_tokenIn);
         }
-        (uint256 amountOut) = _calcSwapOutput(_tokenIn, _tokenOut, _amountIn);
+        (uint256 amountOut, uint256 swapFee) = _calcSwapOutput(_tokenIn, _tokenOut, _amountIn);
+        (uint256 devFee,) = _calcDevFee(swapFee);
+        poolAssets[_tokenIn].feeReserve += devFee;
         if (amountOut < _minOut) {
             revert SlippageExceeded();
         }
-        tokenOut.transfer(_to, amountOut);
+        _doTransferOut(_tokenOut, _to, amountOut);
         emit Swap(_to, _tokenIn, _tokenOut, _amountIn, amountOut, 0);
     }
 
     // ========= Admin functions ========
-    function withdrawETH() external onlyOwner {
-        
-    }
-
     function setFee(Fee memory _fee) external onlyOwner {
         fee = _fee;
     }
@@ -148,19 +166,40 @@ contract Pool is Ownable {
         lpToken = ILPToken(_lp);
     }
 
-    function addToken(address _token, bool _isStableCoin, uint256 _feeReserve) external onlyOwner {
-         if (isListed[_token]) {
+    function addToken(address _token, bool _isStableCoin) external onlyOwner {
+        if (isListed[_token]) {
             revert DuplicateToken(_token);
+        }
+        uint256 nAssets = allAssets.length;
+        if (nAssets + 1 > MAX_ASSETS) {
+            revert TooManyTokenAdded(nAssets, MAX_ASSETS);
         }
         _requireAddress(_token);
         AssetInfo memory assetInfo;
-        assetInfo.isStableCoin = _isStableCoin;
-        assetInfo.feeReserve = _feeReserve;
         poolAssets[_token] = assetInfo;
         allAssets.push(_token);
         isAsset[_token] = true;
         isListed[_token] = true;
+        isStableCoin[_token] = _isStableCoin;
         emit AddPoolToken(_token);
+    }
+
+    function setTargetWeight(TokenWeight[] memory tokens) external onlyOwner {
+        uint256 nTokens = tokens.length;
+        if (nTokens != allAssets.length) {
+            revert RequireAllTokens();
+        }
+        uint256 total;
+        for (uint256 i = 0; i < nTokens; ++i) {
+            TokenWeight memory item = tokens[i];
+            assert(isAsset[item.token]);
+            // unlisted token always has zero weight
+            uint256 weight = isListed[item.token] ? item.weight : 0;
+            targetWeights[item.token] = weight;
+            total += weight;
+        }
+        totalWeight = total;
+        emit TokenWeightSet(tokens);
     }
 
     function changeOracle(address _oracle) external onlyOwner {
@@ -170,8 +209,20 @@ contract Pool is Ownable {
         emit OracleChange(address(oldOracle), address(oracle));
     }
 
-    // ======== Internal functions =========
+    function withdrawFee(address _token, address _recipient) external onlyAsset(_token) onlyOwner {
+        uint256 amount = poolAssets[_token].feeReserve;
+        poolAssets[_token].feeReserve = 0;
+        _doTransferOut(_token, _recipient, amount);
+        emit DevFeeWithdrawn(_token, _recipient, amount);
+    }
 
+    function withdrawWETH(address _token, address _recipient) external onlyAsset(_token) onlyOwner {
+        uint256 amount = IERC20(_token).balanceOf(address(this));
+        poolAssets[_token].feeReserve = 0;
+        _doTransferOut(_token, _recipient, amount);
+    }
+
+    // ======== Internal functions =========
     function _getPoolValue() internal view returns (uint256 sum) {
         uint256[] memory prices = _getAllPrices();
         for (uint256 i = 0; i < allAssets.length;) {
@@ -191,18 +242,15 @@ contract Pool is Ownable {
     }
 
     function _getPrice(address _token) internal view returns (uint256) {
-        return oracle.getPrice(_token);
+        (uint256 price, uint256 lastTimestamp) = oracle.getLastPrice(_token);
+        if (block.timestamp - lastTimestamp > TIME_OUT_ORACLE) {
+            revert TimeOutOracle();
+        }
+        return price;
     }
 
-    function _calcSwapOutput(address _tokenIn, address _tokenOut, uint256 _amountIn)
-        internal
-        view
-        returns (uint256 amountOut)
-    {
-        uint256 priceIn = _getPrice(_tokenIn);
-        uint256 priceOut = _getPrice(_tokenOut);
-        uint256 valueChange = _amountIn * priceIn;
-        amountOut = valueChange / priceOut;
+    function _getLastPrice(address _token) internal view returns (uint256, uint256) {
+        return oracle.getLastPrice(_token);
     }
 
     function _calcRemoveLiquidity(address _tokenOut, uint256 _lpAmount) internal view returns (uint256 outAmount) {
@@ -225,6 +273,65 @@ contract Pool is Ownable {
         }
     }
 
+    function _calcDevFee(uint256 _feeAmount) internal view returns (uint256 devFee, uint256 lpFee) {
+        devFee = MathUtils.frac(_feeAmount, fee.devFee, PRECISION);
+        lpFee = _feeAmount - devFee;
+    }
+
+    function _calcSwapOutput(address _tokenIn, address _tokenOut, uint256 _amountIn)
+        internal
+        view
+        returns (uint256 amountOutAfterFee, uint256 feeAmount)
+    {
+        uint256 priceIn = _getPrice(_tokenIn);
+        uint256 priceOut = _getPrice(_tokenOut);
+        uint256 valueChange = _amountIn * priceIn;
+        uint256 feeIn = _calcSwapFee(_tokenIn, priceIn, valueChange, true);
+        uint256 feeOut = _calcSwapFee(_tokenOut, priceOut, valueChange, false);
+        uint256 _fee = feeIn > feeOut ? feeIn : feeOut;
+
+        amountOutAfterFee = valueChange * (PRECISION - _fee) / priceOut / PRECISION;
+        feeAmount = (valueChange * _fee) / priceIn / PRECISION;
+    }
+
+    function _calcSwapFee(address _token, uint256 _tokenPrice, uint256 _valueChange, bool _isSwapIn)
+        internal
+        view
+        returns (uint256)
+    {
+        (uint256 baseSwapFee, uint256 taxBasisPoint) = isStableCoin[_token]
+            ? (fee.stableCoinBaseSwapFee, fee.stableCoinTaxBasisPoint)
+            : (fee.baseSwapFee, fee.taxBasisPoint);
+        return _calcFeeRate(_token, _tokenPrice, _valueChange, baseSwapFee, taxBasisPoint, _isSwapIn);
+    }
+
+    function _calcFeeRate(
+        address _token,
+        uint256 _tokenPrice,
+        uint256 _valueChange,
+        uint256 _baseFee,
+        uint256 _taxBasisPoint,
+        bool _isIncrease
+    ) internal view returns (uint256) {
+        uint256 _targetValue = totalWeight == 0 ? 0 : (targetWeights[_token] * _getPoolValue()) / totalWeight;
+        if (_targetValue == 0) {
+            return _baseFee;
+        }
+        uint256 _currentAmount = IERC20(_token).balanceOf(address(this)) - poolAssets[_token].feeReserve;
+        uint256 _currentValue = _tokenPrice * _currentAmount;
+        uint256 _nextValue = _isIncrease ? _currentValue + _valueChange : _currentValue - _valueChange;
+        uint256 initDiff = MathUtils.diff(_currentValue, _targetValue);
+        uint256 nextDiff = MathUtils.diff(_nextValue, _targetValue);
+        if (nextDiff < initDiff) {
+            uint256 feeAdjust = (_taxBasisPoint * initDiff) / _targetValue;
+            return MathUtils.zeroCapSub(_baseFee, feeAdjust);
+        } else {
+            uint256 avgDiff = (initDiff + nextDiff) / 2;
+            uint256 feeAdjust = avgDiff > _targetValue ? _taxBasisPoint : (_taxBasisPoint * avgDiff) / _targetValue;
+            return _baseFee + feeAdjust;
+        }
+    }
+
     // ========= Event ===============
 
     event AddPoolToken(address token);
@@ -233,12 +340,15 @@ contract Pool is Ownable {
     event MaxLeverageChanged(uint256 levarage);
     event AddLiquidity(address wallet, address asset, uint256 amount);
     event RemoveLiquidity(address wallet, uint256 amount);
+    event TokenWeightSet(TokenWeight[]);
+    event DevFeeWithdrawn(address indexed token, address recipient, uint256 amount);
     event Swap(
         address indexed sender, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut, uint256 fee
     );
 
     // ========= Error ===============
     error NotAsset(address token);
+    error NotListed(address token);
     error InsufficientPoolAmount(address token);
     error ZeroAddress();
     error SameTokenSwap(address token);
@@ -247,9 +357,12 @@ contract Pool is Ownable {
     error InvalidMaxLeverage();
     error InvalidPositionSize();
     error InvalidLeverage(uint256 size, uint256 margin, uint256 maxLeverage);
-    error PositionNotExists(address owner, address indexToken, address collateralToken, Side side);
+    // error PositionNotExists(address owner, address indexToken, address collateralToken, Side side);
     error UpdateCauseLiquidation();
     error ZeroAmount();
     error PositionNotLiquidated(bytes32 key);
     error DuplicateToken(address token);
+    error TimeOutOracle();
+    error RequireAllTokens();
+    error TooManyTokenAdded(uint256 number, uint256 max);
 }

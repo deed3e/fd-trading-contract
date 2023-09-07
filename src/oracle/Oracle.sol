@@ -5,9 +5,16 @@ pragma solidity >=0.8.19;
 import {Ownable} from "openzeppelin/access/Ownable.sol";
 import {IOracle} from "../interfaces/IOracle.sol";
 
+struct TokenConfig {
+    uint256 baseUnits;
+    uint256 priceUnits;
+}
+
 /// @title PriceFeed
 /// @notice Price feed with guard from
 contract Oracle is Ownable, IOracle {
+    uint256 public constant VALUE_PRECISION = 1e30;
+    mapping(address => TokenConfig) public tokenConfig;
     mapping(address => uint256) public lastAnswers;
     mapping(address => uint256) public lastAnswerTimestamp;
     mapping(address => uint256) public lastAnswerBlock;
@@ -53,6 +60,17 @@ contract Oracle is Ownable, IOracle {
     }
 
     // =========== Restrited functions ===========
+    /// @notice config watched token
+    /// @param token token address
+    /// @param tokenDecimals token decimals
+    /// @param priceDecimals precision of price posted by reporter, not the chainlink price feed
+    function configToken(address token, uint256 tokenDecimals, uint256 priceDecimals) external onlyOwner {
+        require(token != address(0), "PriceFeed:invalidToken");
+        require(tokenDecimals != 0 && priceDecimals != 0, "PriceFeed:invalidDecimals");
+
+        tokenConfig[token] = TokenConfig({baseUnits: 10 ** tokenDecimals, priceUnits: 10 ** priceDecimals});
+        emit TokenAdded(token);
+    }
 
     function addReporter(address reporter) external onlyOwner {
         require(!isReporter[reporter], "PriceFeed:reporterAlreadyAdded");
@@ -76,7 +94,9 @@ contract Oracle is Ownable, IOracle {
     }
 
     function _postPrice(address token, uint256 price) internal {
-        lastAnswers[token] = price;
+        TokenConfig memory config = tokenConfig[token];
+        require(config.baseUnits > 0, "PriceFeed:tokenNotConfigured");
+        lastAnswers[token] = (price * VALUE_PRECISION) / config.baseUnits / config.priceUnits;
         lastAnswerTimestamp[token] = block.timestamp;
         lastAnswerBlock[token] = block.number;
         emit PricePosted(token, price);
@@ -92,6 +112,7 @@ contract Oracle is Ownable, IOracle {
     }
 
     // =========== Events ===========
+    event TokenAdded(address token);
     event ReporterAdded(address indexed);
     event ReporterRemoved(address indexed);
     event PricePosted(address indexed token, uint256 price);
