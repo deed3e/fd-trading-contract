@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity >=0.8.19;
 
+// miss function calc add liqudi out amount
+
 import {Ownable} from "openzeppelin/access/Ownable.sol";
 import {IERC20} from "openzeppelin/interfaces/IERC20.sol";
 import {MathUtils} from "../lib/MathUtils.sol";
@@ -10,12 +12,11 @@ import {SafeCast} from "openzeppelin/utils/math/SafeCast.sol";
 import {SignedIntOps} from "../lib/SignedInt.sol";
 import {IPool} from "../interfaces/IPool.sol";
 
-uint256 constant ORACLE_DECIMAL = 1e8;
 uint256 constant PRECISION = 1e10;
-uint256 constant LP_INITIAL_PRICE = 1e12; // // fix to 1$
+uint256 constant LP_INITIAL_PRICE = 1e12; //fix to 1$
 uint256 constant MAX_BASE_SWAP_FEE = 1e8; // 1%
 uint256 constant MAX_ASSETS = 10;
-uint256 constant TIME_OUT_ORACLE = 1 minutes;
+uint256 constant TIME_OUT_ORACLE = 3 minutes;
 
 struct TokenWeight {
     address token;
@@ -33,7 +34,7 @@ struct Fee {
     uint256 taxBasisPoint;
     uint256 stableCoinBaseSwapFee;
     uint256 stableCoinTaxBasisPoint;
-    uint256 devFee;
+    uint256 daoFee;
 }
 
 contract Pool is Ownable, IPool {
@@ -96,27 +97,24 @@ contract Pool is Ownable, IPool {
         (outAmount) = _calcRemoveLiquidity(_tokenOut, _lpAmount);
     }
 
+    function calcAddLiquidity(address _tokenIn, uint256 _amount)
+        external
+        view
+        returns (uint256 outAmount, uint256 feeAmount)
+    {
+        (outAmount, feeAmount) = _calcAddLiquidity(_tokenIn, _amount);
+    }
+
     // ============= Mutative functions =============
     function addLiquidity(address _token, uint256 _amountIn, uint256 _minLpAmount, address _to)
         external
         onlyAsset(_token)
     {
-        uint256 totalPoolValue = _getPoolValue();
         IERC20(_token).transferFrom(msg.sender, address(this), _amountIn);
-        uint256 priceToken = oracle.getPrice(_token);
-        uint256 totalLP = lpToken.totalSupply();
-        uint256 lpAmount;
-        uint256 valueChange = _amountIn * priceToken;
-        uint256 _fee =
-            _calcFeeRate(_token, priceToken, valueChange, fee.baseAddRemoveLiquidityFee, fee.taxBasisPoint, true);
+        (uint256 lpAmount, uint256 _fee) = _calcAddLiquidity(_token, _amountIn);
         uint256 userAmount = MathUtils.frac(_amountIn, PRECISION - _fee, PRECISION);
-        (uint256 devFee,) = _calcDevFee(_amountIn - userAmount);
-        poolAssets[_token].feeReserve += devFee;
-        if (totalLP > 0) {
-            lpAmount = MathUtils.frac(userAmount * priceToken, totalLP, totalPoolValue);
-        } else {
-            lpAmount = MathUtils.frac(userAmount, priceToken, LP_INITIAL_PRICE);
-        }
+        (uint256 daoFee,) = _calcDaoFee(_amountIn - userAmount);
+        poolAssets[_token].feeReserve += daoFee;
         if (lpAmount < _minLpAmount) {
             revert SlippageExceeded();
         }
@@ -148,13 +146,13 @@ contract Pool is Ownable, IPool {
             revert SameTokenSwap(_tokenIn);
         }
         (uint256 amountOut, uint256 swapFee) = _calcSwapOutput(_tokenIn, _tokenOut, _amountIn);
-        (uint256 devFee,) = _calcDevFee(swapFee);
-        poolAssets[_tokenIn].feeReserve += devFee;
+        (uint256 daoFee,) = _calcDaoFee(swapFee);
+        poolAssets[_tokenIn].feeReserve += daoFee;
         if (amountOut < _minOut) {
             revert SlippageExceeded();
         }
         _doTransferOut(_tokenOut, _to, amountOut);
-        emit Swap(_to, _tokenIn, _tokenOut, _amountIn, amountOut, 0);
+        emit Swap(_to, _tokenIn, _tokenOut, _amountIn, amountOut, swapFee);
     }
 
     // ========= Admin functions ========
@@ -213,7 +211,7 @@ contract Pool is Ownable, IPool {
         uint256 amount = poolAssets[_token].feeReserve;
         poolAssets[_token].feeReserve = 0;
         _doTransferOut(_token, _recipient, amount);
-        emit DevFeeWithdrawn(_token, _recipient, amount);
+        emit DaoFeeWithdrawn(_token, _recipient, amount);
     }
 
     function withdrawWETH(address _token, address _recipient) external onlyAsset(_token) onlyOwner {
@@ -260,6 +258,25 @@ contract Pool is Ownable, IPool {
         outAmount = (_lpAmount * poolValue) / totalLp / priceToken;
     }
 
+    function _calcAddLiquidity(address _tokenIn, uint256 _amount)
+        internal
+        view
+        returns (uint256 outLpAmount, uint256 feeAmount)
+    {
+        uint256 totalPoolValue = _getPoolValue();
+        uint256 priceToken = oracle.getPrice(_tokenIn);
+        uint256 totalLP = lpToken.totalSupply();
+        uint256 valueChange = _amount * priceToken;
+        feeAmount =
+            _calcFeeRate(_tokenIn, priceToken, valueChange, fee.baseAddRemoveLiquidityFee, fee.taxBasisPoint, true);
+        uint256 userAmount = MathUtils.frac(_amount, PRECISION - feeAmount, PRECISION);
+        if (totalLP > 0) {
+            outLpAmount = MathUtils.frac(userAmount * priceToken, totalLP, totalPoolValue);
+        } else {
+            outLpAmount = MathUtils.frac(userAmount, priceToken, LP_INITIAL_PRICE);
+        }
+    }
+
     function _requireAddress(address _address) internal pure {
         if (_address == address(0)) {
             revert ZeroAddress();
@@ -273,9 +290,9 @@ contract Pool is Ownable, IPool {
         }
     }
 
-    function _calcDevFee(uint256 _feeAmount) internal view returns (uint256 devFee, uint256 lpFee) {
-        devFee = MathUtils.frac(_feeAmount, fee.devFee, PRECISION);
-        lpFee = _feeAmount - devFee;
+    function _calcDaoFee(uint256 _feeAmount) internal view returns (uint256 daoFee, uint256 lpFee) {
+        daoFee = MathUtils.frac(_feeAmount, fee.daoFee, PRECISION);
+        lpFee = _feeAmount - daoFee;
     }
 
     function _calcSwapOutput(address _tokenIn, address _tokenOut, uint256 _amountIn)
@@ -341,7 +358,7 @@ contract Pool is Ownable, IPool {
     event AddLiquidity(address wallet, address asset, uint256 amount);
     event RemoveLiquidity(address wallet, uint256 amount);
     event TokenWeightSet(TokenWeight[]);
-    event DevFeeWithdrawn(address indexed token, address recipient, uint256 amount);
+    event DaoFeeWithdrawn(address indexed token, address recipient, uint256 amount);
     event Swap(
         address indexed sender, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut, uint256 fee
     );

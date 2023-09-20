@@ -7,18 +7,20 @@ import {Pool} from "../src/pool/Pool.sol";
 import {LPToken} from "../src/tokens/LPToken.sol";
 import {WETH9} from "../src/helper/WETH9.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
-import {LiquidityRouter} from "../src/pool/LiquidityRouter.sol";
+import {Router} from "../src/pool/Router.sol";
 
 contract Poolz is Test {
     Oracle public oracle;
     Pool public pool;
-    LiquidityRouter public router;
+    Router public router;
     //OrderManager public orderManager;
 
     LPToken public lp;
     MockERC20 public btc;
     MockERC20 public eth;
     WETH9 public weth;
+
+    address public constant ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
     address public reporter = vm.addr(1);
     address public deployper = vm.addr(2);
@@ -46,7 +48,7 @@ contract Poolz is Test {
         pool.addToken(address(btc), false);
         pool.addToken(address(eth), false);
         pool.addToken(address(weth), false);
-        router = new LiquidityRouter(address(pool),address(weth),address(lp));
+        router = new Router(address(pool),address(weth),address(lp));
         //=====
         //orderManager = new OrderManager();
         //orderManager.setOracle(address(oracle));
@@ -64,7 +66,7 @@ contract Poolz is Test {
         addresses[2] = address(weth);
 
         uint256[] memory prices = new uint256[](3);
-        prices[0] = 25000e8;
+        prices[0] = 25_000e8;
         prices[1] = 1700e8;
         prices[2] = 220e8;
         oracle.postPrices(addresses, prices);
@@ -72,60 +74,91 @@ contract Poolz is Test {
     }
 
     function addLiquidity() public {
-        // // linda add
-        // vm.startBroadcast(linda);
-        // btc.mint(1000 * 1e8);
-        // btc.approve(address(pool), type(uint256).max);
-        // pool.addLiquidity(address(btc), 100e8, 0, linda);
-        // vm.stopBroadcast();
+        // linda add
+        vm.startBroadcast(linda);
+        btc.mint(1000 * 1e8);
+        btc.approve(address(router), type(uint256).max);
+        router.addLiquidity(address(btc), 100e8, 0);
+        vm.stopBroadcast();
 
         // alice add
-        // vm.startBroadcast(alice);
-        // eth.mint(100e18);
-        // eth.approve(address(router), type(uint256).max);
-        // router.addLiquidity(address(eth), 10e18, 0, alice);
-        // vm.stopBroadcast();
+        vm.startBroadcast(alice);
+        eth.mint(1000e18);
+        eth.approve(address(router), type(uint256).max);
+        router.addLiquidity(address(eth), 1000e18, 0);
+        vm.stopBroadcast();
 
         //mike add
         vm.startBroadcast(mike);
-        vm.deal(mike, 100e18);
-        router.addLiquidityETH{value: 100e18}(0, mike);
+        vm.deal(mike, 1000e18);
+        router.addLiquidity{value: 1000e18}(ETH, 1000e18, 0);
         uint256 vault = pool.getPoolValue();
         console.log("vault :", vault);
-         vm.stopBroadcast();
+        vm.stopBroadcast();
     }
 
-    // function testRemoveLiquidity() public {
-    //     addLiquidity();
-    //     // alice remove
-    //     vm.startBroadcast(alice);
-    //     lp.approve(address(pool), lp.balanceOf(alice));
-    //     vm.stopBroadcast();
-    //     pool.removeLiquidity(address(eth), lp.balanceOf(alice), 0, alice);
-    //     console.log("balance alice", eth.balanceOf(alice));
-    // }
+    function testRemoveLiquidity() public {
+        addLiquidity();
+        // alice remove
+        vm.startBroadcast(alice);
+        lp.approve(address(router), lp.balanceOf(alice));
+         console.log("balance lp alice",lp.balanceOf(alice));
+        console.log("balance alice", eth.balanceOf(alice));
+        router.removeLiquidity(address(eth), lp.balanceOf(alice), 0);
+        console.log("balance alice", eth.balanceOf(alice));
+        vm.stopBroadcast();
+        uint256 vault = pool.getPoolValue();
+        console.log("vault :", vault);
+    }
 
-    function testRemoveLiquidityETH() public {
+    function testRemoveLiquidityBnb() public {
         addLiquidity();
         // MIKE remove
-         vm.startBroadcast(mike);
+        vm.startBroadcast(mike);
         lp.approve(address(router), lp.balanceOf(mike));
-        router.removeLiquidityETH(lp.balanceOf(mike), 0, payable(mike));
+        router.removeLiquidity(ETH, lp.balanceOf(mike), 0);
         console.log("balance mike", mike.balance);
     }
 
-    // function testSwap() public {
-    //     addLiquidity();
-    //     // mike swap
-    //     vm.startBroadcast(mike);
-    //     btc.mint(50e8);
-    //     btc.approve(address(pool), btc.balanceOf(mike));
-    //     console.log("balance eth mike", btc.balanceOf(mike));
-    //     pool.swap(address(btc), address(eth), 1e8, 0, address(mike));
-    //     console.log("balance eth mike", eth.balanceOf(mike));
-    //     console.log("rs need = 25000/1700 ");
-    //     vm.stopBroadcast();
-    // }
+    // eth - > erc20
+    function testSwapBnb() public {
+        addLiquidity();
+        // mike swap
+        vm.startBroadcast(mike);
+        vm.deal(mike, 1e18);
+        console.log("balance eth mike", eth.balanceOf(mike));
+        router.swap{value: 1e18}(ETH, address(eth), 1e8, 0);
+        console.log("balance eth mike", eth.balanceOf(mike));
+        console.log("rs need = 220/1700 ");
+        vm.stopBroadcast();
+    }
+
+    //erc20 -> eth
+    function testSwapBnbRe() public {
+        addLiquidity();
+        // mike swap
+        vm.startBroadcast(mike);
+        btc.mint(1e4);
+        btc.approve(address(router), btc.balanceOf(mike));
+        console.log("balance bnb mike", mike.balance);
+        router.swap(address(btc), ETH, 1e4, 0); // 0.01 btc
+        console.log("balance eth mike", mike.balance);
+        console.log("rs need = 250/220/100 ");
+        vm.stopBroadcast();
+    }
+
+    function testSwap() public {
+        addLiquidity();
+        // mike swap
+        vm.startBroadcast(mike);
+        btc.mint(50e8);
+        btc.approve(address(router), btc.balanceOf(mike));
+        console.log("balance eth mike", eth.balanceOf(mike));
+        router.swap(address(btc), address(eth), 1e8, 0);
+        console.log("balance eth mike", eth.balanceOf(mike));
+        console.log("rs need = 2500/1700 ");
+        vm.stopBroadcast();
+    }
 
     // function testLongPosition() public {
     //     // mike swap
