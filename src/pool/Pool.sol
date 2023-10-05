@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity >=0.8.19;
 
-// miss function calc add liqudi out amount
-
 import {Ownable} from "openzeppelin/access/Ownable.sol";
 import {IERC20} from "openzeppelin/interfaces/IERC20.sol";
 import {MathUtils} from "../lib/MathUtils.sol";
@@ -16,7 +14,7 @@ uint256 constant PRECISION = 1e10;
 uint256 constant LP_INITIAL_PRICE = 1e12; //fix to 1$
 uint256 constant MAX_BASE_SWAP_FEE = 1e8; // 1%
 uint256 constant MAX_ASSETS = 10;
-uint256 constant TIME_OUT_ORACLE = 3 minutes;
+uint256 constant TIME_OUT_ORACLE = 1 minutes;
 
 struct TokenWeight {
     address token;
@@ -102,7 +100,8 @@ contract Pool is Ownable, IPool {
         view
         returns (uint256 outAmount, uint256 feeAmount)
     {
-        (outAmount, feeAmount) = _calcAddLiquidity(_tokenIn, _amount);
+        uint256 markPrice = _getPrice(_tokenIn);
+        (outAmount, feeAmount) = _calcAddLiquidity(_tokenIn, _amount, markPrice);
     }
 
     // ============= Mutative functions =============
@@ -111,29 +110,30 @@ contract Pool is Ownable, IPool {
         onlyAsset(_token)
     {
         IERC20(_token).transferFrom(msg.sender, address(this), _amountIn);
-        (uint256 lpAmount, uint256 _fee) = _calcAddLiquidity(_token, _amountIn);
-        uint256 userAmount = MathUtils.frac(_amountIn, PRECISION - _fee, PRECISION);
-        (uint256 daoFee,) = _calcDaoFee(_amountIn - userAmount);
+        uint256 markPrice = _getPrice(_token);
+        (uint256 lpAmount, uint256 _feeAmount) = _calcAddLiquidity(_token, _amountIn, markPrice);
+        (uint256 daoFee,) = _calcDaoFee(_feeAmount);
         poolAssets[_token].feeReserve += daoFee;
         if (lpAmount < _minLpAmount) {
             revert SlippageExceeded();
         }
         lpToken.mint(_to, lpAmount);
-        emit AddLiquidity(_to, _token, _amountIn);
+        emit AddLiquidity(_to, _token, _amountIn, _feeAmount, markPrice);
     }
 
-    function removeLiquidity(address _tokenOut, uint256 _lpAmount, uint256 _minOut, address _to)
+    function removeLiquidity(address _tokenOut, uint256 _lpAmount, uint256 _minOut, address _wallet)
         external
         sureEnoughBalance(_tokenOut, _minOut)
         onlyAsset(_tokenOut)
     {
         (uint256 outAmount) = _calcRemoveLiquidity(_tokenOut, _lpAmount);
+        uint256 markPrice = _getPrice(_tokenOut);
         if (outAmount < _minOut) {
             revert SlippageExceeded();
         }
         lpToken.burnFrom(msg.sender, _lpAmount);
-        _doTransferOut(_tokenOut, _to, outAmount);
-        emit RemoveLiquidity(_to, outAmount);
+        _doTransferOut(_tokenOut, _wallet, outAmount);
+        emit RemoveLiquidity(_wallet, _tokenOut, outAmount, markPrice);
     }
 
     function swap(address _tokenIn, address _tokenOut, uint256 _amountIn, uint256 _minOut, address _to)
@@ -145,6 +145,7 @@ contract Pool is Ownable, IPool {
         if (_tokenIn == _tokenOut) {
             revert SameTokenSwap(_tokenIn);
         }
+        uint256 markPriceIn = _getPrice(_tokenIn);
         (uint256 amountOut, uint256 swapFee) = _calcSwapOutput(_tokenIn, _tokenOut, _amountIn);
         (uint256 daoFee,) = _calcDaoFee(swapFee);
         poolAssets[_tokenIn].feeReserve += daoFee;
@@ -152,7 +153,7 @@ contract Pool is Ownable, IPool {
             revert SlippageExceeded();
         }
         _doTransferOut(_tokenOut, _to, amountOut);
-        emit Swap(_to, _tokenIn, _tokenOut, _amountIn, amountOut, swapFee);
+        emit Swap(_to, _tokenIn, _tokenOut, _amountIn, amountOut, swapFee, markPriceIn);
     }
 
     // ========= Admin functions ========
@@ -258,18 +259,18 @@ contract Pool is Ownable, IPool {
         outAmount = (_lpAmount * poolValue) / totalLp / priceToken;
     }
 
-    function _calcAddLiquidity(address _tokenIn, uint256 _amount)
+    function _calcAddLiquidity(address _tokenIn, uint256 _amount, uint256 priceToken)
         internal
         view
         returns (uint256 outLpAmount, uint256 feeAmount)
     {
         uint256 totalPoolValue = _getPoolValue();
-        uint256 priceToken = oracle.getPrice(_tokenIn);
         uint256 totalLP = lpToken.totalSupply();
         uint256 valueChange = _amount * priceToken;
-        feeAmount =
+        uint256 feeRate =
             _calcFeeRate(_tokenIn, priceToken, valueChange, fee.baseAddRemoveLiquidityFee, fee.taxBasisPoint, true);
-        uint256 userAmount = MathUtils.frac(_amount, PRECISION - feeAmount, PRECISION);
+        uint256 userAmount = MathUtils.frac(_amount, PRECISION - feeRate, PRECISION);
+        feeAmount = _amount - userAmount;
         if (totalLP > 0) {
             outLpAmount = MathUtils.frac(userAmount * priceToken, totalLP, totalPoolValue);
         } else {
@@ -355,12 +356,34 @@ contract Pool is Ownable, IPool {
     event SetOrderManager(address manager);
     event OracleChange(address oldOracle, address newOracle);
     event MaxLeverageChanged(uint256 levarage);
-    event AddLiquidity(address wallet, address asset, uint256 amount);
-    event RemoveLiquidity(address wallet, uint256 amount);
+    event RemoveLiquidity(address wallet, address tokenOut, uint256 amount, uint256 markPrice);
     event TokenWeightSet(TokenWeight[]);
     event DaoFeeWithdrawn(address indexed token, address recipient, uint256 amount);
+    event AddLiquidity(address wallet, address asset, uint256 amount, uint256 fee, uint256 markPriceIn);
+    event IncreasePosition(
+        address indexed account,
+        address indexToken,
+        address collateralToken,
+        address collateral,
+        uint256 sizeChanged,
+        bool side
+    );
+    event DecreasePosition(
+        address indexed account,
+        address indexToken,
+        address collateralToken,
+        address collateral,
+        uint256 sizeChanged,
+        bool side
+    );
     event Swap(
-        address indexed sender, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut, uint256 fee
+        address indexed sender,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 fee,
+        uint256 markPrice
     );
 
     // ========= Error ===============
@@ -374,7 +397,7 @@ contract Pool is Ownable, IPool {
     error InvalidMaxLeverage();
     error InvalidPositionSize();
     error InvalidLeverage(uint256 size, uint256 margin, uint256 maxLeverage);
-    // error PositionNotExists(address owner, address indexToken, address collateralToken, Side side);
+    error PositionNotExists(address owner, address indexToken, address collateralToken, Side side);
     error UpdateCauseLiquidation();
     error ZeroAmount();
     error PositionNotLiquidated(bytes32 key);

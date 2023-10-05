@@ -14,11 +14,10 @@ import {Test, console} from "forge-std/Test.sol";
 contract Push is Script {
     Oracle _oracle;
     address _reporter = address(0xd57F41BF686b2Ffd2C66Eb939BF991499775f40C);
-    //Demo _demo;
+
     MockERC20 _eth;
     MockERC20 _usdt;
     MockERC20 _btc;
-
     WETH9 _weth;
 
     Pool _pool;
@@ -30,8 +29,10 @@ contract Push is Script {
         vm.startBroadcast(owner);
         _oracle = new Oracle();
         _oracle.addReporter(_reporter);
+        _oracle.addReporter(_reporter2);
+        _oracle.addReporter(_reporter3);
         _eth = new MockERC20("ETH", "ETH", 18);
-        _usdt = new MockERC20("Tether USD", "USDT", 6);
+        _usdt = new MockERC20("USD Coin", "USDC", 6);
         _btc = new MockERC20("BTC", "BTC", 8);
         _weth = new WETH9();
         _oracle.configToken(address(_btc), 8, 8);

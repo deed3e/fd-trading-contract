@@ -100,6 +100,7 @@ contract Oracle is Ownable, IOracle {
         lastAnswerTimestamp[token] = block.timestamp;
         lastAnswerBlock[token] = block.number;
         emit PricePosted(token, price);
+        emit ReporterPosted(msg.sender);
     }
 
     function _getPrice(address token) internal view returns (uint256) {
@@ -113,7 +114,8 @@ contract Oracle is Ownable, IOracle {
 
     // =========== Events ===========
     event TokenAdded(address token);
-    event ReporterAdded(address indexed);
-    event ReporterRemoved(address indexed);
+    event ReporterAdded(address wallet);
+    event ReporterRemoved(address wallet);
+    event ReporterPosted(address wallet);
     event PricePosted(address indexed token, uint256 price);
 }
