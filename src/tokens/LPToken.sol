@@ -19,4 +19,11 @@ contract LPToken is ERC20Burnable {
         require(msg.sender == minter, "LPToken: !minter");
         _mint(_to, _amount);
     }
+
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        require(spender == minter, "LPToken: not approve other minter");
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
 }

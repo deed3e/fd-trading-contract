@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-
 pragma solidity >=0.8.19;
 
 import {Ownable} from "openzeppelin/access/Ownable.sol";
@@ -11,7 +10,6 @@ struct TokenConfig {
 }
 
 /// @title PriceFeed
-/// @notice Price feed with guard from
 contract Oracle is Ownable, IOracle {
     uint256 public constant VALUE_PRECISION = 1e30;
     mapping(address => TokenConfig) public tokenConfig;

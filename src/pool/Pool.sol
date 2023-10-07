@@ -7,8 +7,12 @@ import {MathUtils} from "../lib/MathUtils.sol";
 import {IOracle} from "../interfaces/IOracle.sol";
 import {ILPToken} from "../interfaces/ILPToken.sol";
 import {SafeCast} from "openzeppelin/utils/math/SafeCast.sol";
-import {SignedIntOps} from "../lib/SignedInt.sol";
+import {SignedInt, SignedIntOps} from "../lib/SignedInt.sol";
 import {IPool} from "../interfaces/IPool.sol";
+import {PositionUtils} from "../lib/PositionUtils.sol";
+import {Side} from "../interfaces/IPool.sol";
+
+import {console} from "forge-std/Test.sol";
 
 uint256 constant PRECISION = 1e10;
 uint256 constant LP_INITIAL_PRICE = 1e12; //fix to 1$
@@ -24,6 +28,28 @@ struct TokenWeight {
 struct AssetInfo {
     uint256 feeReserve;
     uint256 borrowIndex;
+    uint256 lastAccrualTimestamp;
+    /// @notice amount of token deposited (via add liquidity or increase long position)
+    uint256 poolAmount;
+    /// @notice amount of token reserved for paying out when user decrease long position
+    uint256 reservedAmount;
+    /// @notice total borrowed (in USD) to leverage
+    uint256 guaranteedValue;
+    /// @notice total size of all short positions
+    uint256 totalShortSize;
+}
+
+enum DecreaseType {
+    UPDATE,
+    CLOSE
+}
+
+struct Position {
+    uint256 size;
+    uint256 collateralValue;
+    uint256 reserveAmount;
+    uint256 entryPrice;
+    uint256 borrowIndex;
 }
 
 struct Fee {
@@ -33,6 +59,8 @@ struct Fee {
     uint256 stableCoinBaseSwapFee;
     uint256 stableCoinTaxBasisPoint;
     uint256 daoFee;
+    uint256 liquidationFee;
+    uint256 positionFee;
 }
 
 contract Pool is Ownable, IPool {
@@ -45,27 +73,29 @@ contract Pool is Ownable, IPool {
     address[] public allAssets;
     mapping(address => AssetInfo) public poolAssets;
     mapping(address => bool) public isAsset;
-    mapping(address => bool) public isListed;
     mapping(address => bool) public isStableCoin;
     mapping(address => uint256) public targetWeights;
     ILPToken public lpToken;
     uint256 public totalWeight;
 
+    address public orderManager;
+    uint256 public maxLeverage;
+
+    uint256 public interestRate;
+    uint256 public accrualInterval;
+    mapping(bytes32 => Position) public positions;
+
     /* =========== MODIFIERS ========== */
-    constructor(address _oracle) {
+    constructor(address _oracle, uint256 _interestRate, uint256 _accrualInterval) {
         oracle = IOracle(_oracle);
+        fee.liquidationFee = 5e3;
+        interestRate = _interestRate;
+        accrualInterval = _accrualInterval;
     }
 
     modifier onlyAsset(address _token) {
         if (!isAsset[_token]) {
             revert NotAsset(_token);
-        }
-        _;
-    }
-
-    modifier onlyListed(address _token) {
-        if (!isListed[_token]) {
-            revert NotListed(_token);
         }
         _;
     }
@@ -78,7 +108,13 @@ contract Pool is Ownable, IPool {
         _;
     }
 
+    modifier onlyOrderManager() {
+        _requireOrderManager();
+        _;
+    }
+
     // ========= View functions =========
+
     function getPoolValue() external view returns (uint256) {
         return _getPoolValue();
     }
@@ -110,6 +146,7 @@ contract Pool is Ownable, IPool {
         onlyAsset(_token)
     {
         IERC20(_token).transferFrom(msg.sender, address(this), _amountIn);
+        _accrueInterest(_token);
         uint256 markPrice = _getPrice(_token);
         (uint256 lpAmount, uint256 _feeAmount) = _calcAddLiquidity(_token, _amountIn, markPrice);
         (uint256 daoFee,) = _calcDaoFee(_feeAmount);
@@ -126,6 +163,7 @@ contract Pool is Ownable, IPool {
         sureEnoughBalance(_tokenOut, _minOut)
         onlyAsset(_tokenOut)
     {
+        _accrueInterest(_tokenOut);
         (uint256 outAmount) = _calcRemoveLiquidity(_tokenOut, _lpAmount);
         uint256 markPrice = _getPrice(_tokenOut);
         if (outAmount < _minOut) {
@@ -140,11 +178,12 @@ contract Pool is Ownable, IPool {
         external
         sureEnoughBalance(_tokenOut, _minOut)
         onlyAsset(_tokenOut)
-        onlyListed(_tokenIn)
     {
         if (_tokenIn == _tokenOut) {
             revert SameTokenSwap(_tokenIn);
         }
+        _accrueInterest(_tokenIn);
+        _accrueInterest(_tokenOut);
         uint256 markPriceIn = _getPrice(_tokenIn);
         (uint256 amountOut, uint256 swapFee) = _calcSwapOutput(_tokenIn, _tokenOut, _amountIn);
         (uint256 daoFee,) = _calcDaoFee(swapFee);
@@ -156,7 +195,135 @@ contract Pool is Ownable, IPool {
         emit Swap(_to, _tokenIn, _tokenOut, _amountIn, amountOut, swapFee, markPriceIn);
     }
 
+    function increasePosition(
+        address _owner,
+        address _indexToken,
+        address _collateralToken,
+        uint256 _collateralAmount,
+        uint256 _sizeChanged,
+        Side _side
+    ) external onlyAsset(_indexToken) onlyAsset(_collateralToken) onlyOrderManager {
+        bytes32 key = _getPositionKey(_owner, _indexToken, _collateralToken, _side);
+        Position memory position = positions[key];
+        uint256 collateralPrice = oracle.getPrice(_collateralToken);
+        uint256 indexPrice = oracle.getPrice(_indexToken);
+        uint256 reserveAdded = _sizeChanged / collateralPrice;
+        uint256 borrowIndex = _accrueInterest(_collateralToken);
+        uint256 feeValue = _calcPositionFee(position, _sizeChanged, borrowIndex);
+
+        position.entryPrice = PositionUtils.calcAveragePrice(
+            _side, position.size, position.size + _sizeChanged, position.entryPrice, indexPrice, 0
+        );
+        position.collateralValue = MathUtils.zeroCapSub(
+            position.collateralValue + (collateralPrice * _collateralAmount),
+            _calcPositionFee(position, _sizeChanged, borrowIndex)
+        );
+        position.size += _sizeChanged;
+        position.reserveAmount += reserveAdded;
+
+        _validatePosition(position, true);
+        positions[key] = position;
+
+        emit IncreasePosition(
+            key, _owner, _collateralToken, _indexToken, _collateralAmount, _sizeChanged, _side, indexPrice, feeValue
+        );
+    }
+
+    function decreasePosition(
+        address _owner,
+        address _indexToken,
+        address _collateralToken,
+        uint256 _collateralChanged,
+        uint256 _sizeChanged,
+        Side _side,
+        address _receiver
+    ) external onlyAsset(_indexToken) onlyAsset(_collateralToken) onlyOrderManager {
+        bytes32 key = _getPositionKey(_owner, _indexToken, _collateralToken, _side);
+        Position memory position = positions[key];
+       _accrueInterest(_collateralToken);
+        if (position.size == 0) {
+            revert PositionNotExists(_owner, _indexToken, _collateralToken, _side);
+        }
+
+        uint256 sizeChanged = _sizeChanged > position.size ? position.size : _sizeChanged;
+        (
+            uint256 payoutAmount,
+            uint256 collateralReduced,
+            int256 remainingCollateral,
+            uint256 reserveReduced,
+            uint256 indexPrice,
+            int256 pnl,
+            uint256 feeValue
+        ) = _calcDecreasePayout(position, _indexToken, _collateralToken, _side, sizeChanged, _collateralChanged, false);
+        collateralReduced = position.collateralValue - uint256(remainingCollateral);
+        position.size = position.size - sizeChanged;
+        position.reserveAmount = position.reserveAmount - reserveReduced;
+        position.collateralValue = uint256(remainingCollateral);
+        console.log("feeValue", feeValue);
+        _validatePosition(position, false);
+        if (position.size == 0) {
+            emit DecreasePosition(
+                key,
+                _owner,
+                _collateralToken,
+                _indexToken,
+                collateralReduced,
+                sizeChanged,
+                _side,
+                indexPrice,
+                pnl.asTuple(),
+                feeValue,
+                DecreaseType.CLOSE
+            );
+            delete positions[key];
+        } else {
+            emit DecreasePosition(
+                key,
+                _owner,
+                _collateralToken,
+                _indexToken,
+                collateralReduced,
+                sizeChanged,
+                _side,
+                indexPrice,
+                pnl.asTuple(),
+                feeValue,
+                DecreaseType.UPDATE
+            );
+            positions[key] = position;
+        }
+        IERC20(_collateralToken).transfer(_receiver, payoutAmount);
+    }
+
+    function liquidatePosition(address _account, address _indexToken, address _collateralToken, Side _side)
+        external
+        onlyAsset(_indexToken)
+        onlyAsset(_collateralToken)
+    {
+        bytes32 key = _getPositionKey(_account, _indexToken, _collateralToken, _side);
+        Position memory position = positions[key];
+        uint256 markPrice = oracle.getPrice(_indexToken);
+        uint256 borrowIndex = _accrueInterest(_collateralToken);
+        if (!_liquidatePositionAllowed(position, _side, markPrice, borrowIndex)) {
+            revert PositionNotLiquidated(key);
+        }
+        (uint256 payoutAmount,,,,,,) = _calcDecreasePayout(
+            position, _indexToken, _collateralToken, _side, position.size, position.collateralValue, true
+        );
+
+        uint256 collateralPrice = _getPrice(_collateralToken);
+        delete positions[key];
+        _doTransferOut(_collateralToken, _account, payoutAmount);
+        _doTransferOut(_collateralToken, msg.sender, fee.liquidationFee / collateralPrice);
+    }
+
     // ========= Admin functions ========
+
+    function setOrderManager(address _orderManager) external onlyOwner {
+        _requireAddress(_orderManager);
+        orderManager = _orderManager;
+    }
+
     function setFee(Fee memory _fee) external onlyOwner {
         fee = _fee;
     }
@@ -166,7 +333,7 @@ contract Pool is Ownable, IPool {
     }
 
     function addToken(address _token, bool _isStableCoin) external onlyOwner {
-        if (isListed[_token]) {
+        if (isAsset[_token]) {
             revert DuplicateToken(_token);
         }
         uint256 nAssets = allAssets.length;
@@ -178,7 +345,6 @@ contract Pool is Ownable, IPool {
         poolAssets[_token] = assetInfo;
         allAssets.push(_token);
         isAsset[_token] = true;
-        isListed[_token] = true;
         isStableCoin[_token] = _isStableCoin;
         emit AddPoolToken(_token);
     }
@@ -192,10 +358,8 @@ contract Pool is Ownable, IPool {
         for (uint256 i = 0; i < nTokens; ++i) {
             TokenWeight memory item = tokens[i];
             assert(isAsset[item.token]);
-            // unlisted token always has zero weight
-            uint256 weight = isListed[item.token] ? item.weight : 0;
-            targetWeights[item.token] = weight;
-            total += weight;
+            targetWeights[item.token] = item.weight;
+            total += item.weight;
         }
         totalWeight = total;
         emit TokenWeightSet(tokens);
@@ -219,6 +383,10 @@ contract Pool is Ownable, IPool {
         uint256 amount = IERC20(_token).balanceOf(address(this));
         poolAssets[_token].feeReserve = 0;
         _doTransferOut(_token, _recipient, amount);
+    }
+
+    function setMaxLeverage(uint256 _maxLeverage) external onlyOwner {
+        _setMaxLeverage(_maxLeverage);
     }
 
     // ======== Internal functions =========
@@ -284,13 +452,6 @@ contract Pool is Ownable, IPool {
         }
     }
 
-    function _doTransferOut(address _token, address _to, uint256 _amount) internal {
-        if (_amount != 0) {
-            IERC20 token = IERC20(_token);
-            token.transfer(_to, _amount);
-        }
-    }
-
     function _calcDaoFee(uint256 _feeAmount) internal view returns (uint256 daoFee, uint256 lpFee) {
         daoFee = MathUtils.frac(_feeAmount, fee.daoFee, PRECISION);
         lpFee = _feeAmount - daoFee;
@@ -350,6 +511,154 @@ contract Pool is Ownable, IPool {
         }
     }
 
+    function _getPositionKey(address _owner, address _indexToken, address _collateralToken, Side _side)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(_owner, _indexToken, _collateralToken, _side));
+    }
+
+    function _requireOrderManager() internal view {
+        if (msg.sender != orderManager) {
+            revert OrderManagerOnly();
+        }
+    }
+
+    function _validatePosition(Position memory _position, bool _isIncrease) internal view {
+        if ((_isIncrease && _position.size == 0)) {
+            revert InvalidPositionSize();
+        }
+
+        if (_position.size < _position.collateralValue || _position.size > _position.collateralValue * maxLeverage) {
+            revert InvalidLeverage(_position.size, _position.collateralValue, maxLeverage);
+        }
+    }
+
+    function _setMaxLeverage(uint256 _maxLeverage) internal {
+        if (_maxLeverage == 0) {
+            revert InvalidMaxLeverage();
+        }
+        maxLeverage = _maxLeverage;
+        emit MaxLeverageChanged(_maxLeverage);
+    }
+    // need refactor
+
+    function _calcDecreasePayout(
+        Position memory _position,
+        address _indexToken,
+        address _collateralToken,
+        Side _side,
+        uint256 _sizeChanged,
+        uint256 _collateralChanged,
+        bool isLiquidate
+    )
+        internal
+        view
+        returns (
+            uint256 payoutAmount,
+            uint256 collateralReduced,
+            int256 remainingCollateral,
+            uint256 reserveReduced,
+            uint256 indexPrice,
+            int256 pnl,
+            uint256 feeValue
+        )
+    {
+        collateralReduced = _position.collateralValue < _collateralChanged || _position.size == _sizeChanged
+            ? _position.collateralValue
+            : _collateralChanged;
+        indexPrice = oracle.getPrice(_indexToken);
+        uint256 collateralPrice = oracle.getPrice(_collateralToken);
+        reserveReduced = (_position.reserveAmount * _sizeChanged) / _position.size;
+        pnl = PositionUtils.calcPnl(_side, _sizeChanged, _position.entryPrice, indexPrice);
+        feeValue = _calcPositionFee(_position, _sizeChanged, poolAssets[_collateralToken].borrowIndex);
+        int256 payoutValue = pnl + collateralReduced.toInt256() - feeValue.toInt256();
+        if (isLiquidate) {
+            payoutValue = payoutValue - fee.liquidationFee.toInt256();
+        }
+        remainingCollateral = (_position.collateralValue - collateralReduced).toInt256();
+        if (payoutValue < 0) {
+            remainingCollateral = remainingCollateral + payoutValue;
+            payoutValue = 0;
+        }
+        payoutAmount = uint256(payoutValue / collateralPrice.toInt256());
+        int256 poolValueReduced = pnl;
+        if (remainingCollateral < 0) {
+            if (!isLiquidate) {
+                revert UpdateCauseLiquidation();
+            }
+            // if liquidate too slow, pool must take the lost
+            poolValueReduced = poolValueReduced - int256(remainingCollateral);
+            remainingCollateral = 0;
+        }
+        if (_side == Side.LONG) {
+            poolValueReduced = poolValueReduced + int256(collateralReduced);
+        } else if (poolValueReduced < 0) {
+            // in case of SHORT, trader can lost unlimited value but pool can only increase at most collateralValue - liquidationFee
+            poolValueReduced =
+                poolValueReduced.cap(MathUtils.zeroCapSub(_position.collateralValue, feeValue + fee.liquidationFee));
+        }
+    }
+
+    function _liquidatePositionAllowed(Position memory _position, Side _side, uint256 _indexPrice, uint256 _borrowIndex)
+        internal
+        view
+        returns (bool)
+    {
+        if (_position.size == 0) {
+            console.log("hhhhhhhh0");
+            return false;
+        }
+        // calculate fee needed when close position
+        uint256 feeValue = _calcPositionFee(_position, _position.size, _borrowIndex);
+        int256 pnl = PositionUtils.calcPnl(_side, _position.size, _position.entryPrice, _indexPrice);
+        int256 collateral = pnl + _position.collateralValue.toInt256();
+        console.log("collateral");
+        console.logInt(collateral);
+        console.log("feeValue",feeValue);
+        console.log("fee.liquidationFee",fee.liquidationFee);
+        // liquidation occur when collateral cannot cover margin fee
+        return collateral < 0 || uint256(collateral) < (feeValue + fee.liquidationFee);
+    }
+
+    function _doTransferOut(address _token, address _to, uint256 _amount) internal {
+        if (_amount != 0) {
+            IERC20 token = IERC20(_token);
+            token.transfer(_to, _amount);
+        }
+    }
+
+    function _calcPositionFee(Position memory _position, uint256 _sizeChanged, uint256 _borrowIndex)
+        internal
+        view
+        returns (uint256 feeValue)
+    {
+        uint256 borrowFee = ((_borrowIndex - _position.borrowIndex) * _position.size) / PRECISION;
+        uint256 positionFee = (_sizeChanged * fee.positionFee) / PRECISION;
+        feeValue = borrowFee + positionFee;
+    }
+
+    function _accrueInterest(address _token) internal returns (uint256) {
+        AssetInfo memory tokenInfo = poolAssets[_token];
+        uint256 _now = block.timestamp;
+        if (tokenInfo.lastAccrualTimestamp == 0 || tokenInfo.poolAmount == 0) {
+            tokenInfo.lastAccrualTimestamp = (_now / accrualInterval) * accrualInterval;
+        } else {
+            uint256 nInterval = (_now - tokenInfo.lastAccrualTimestamp) / accrualInterval;
+            if (nInterval == 0) {
+                return tokenInfo.borrowIndex;
+            }
+
+            tokenInfo.borrowIndex += (nInterval * interestRate * tokenInfo.reservedAmount) / tokenInfo.poolAmount;
+            tokenInfo.lastAccrualTimestamp += nInterval * accrualInterval;
+        }
+
+        poolAssets[_token] = tokenInfo;
+        emit InterestAccrued(_token, tokenInfo.borrowIndex);
+        return tokenInfo.borrowIndex;
+    }
+
     // ========= Event ===============
 
     event AddPoolToken(address token);
@@ -384,6 +693,31 @@ contract Pool is Ownable, IPool {
         uint256 amountOut,
         uint256 fee,
         uint256 markPrice
+    );
+    event InterestAccrued(address indexed token, uint256 borrowIndex);
+    event IncreasePosition(
+        bytes32 indexed key,
+        address wallet,
+        address collateralToken,
+        address indexToken,
+        uint256 collateralValue,
+        uint256 sizeChanged,
+        Side side,
+        uint256 indexPrice,
+        uint256 feeValue
+    );
+    event DecreasePosition(
+        bytes32 indexed key,
+        address wallet,
+        address collateralToken,
+        address indexToken,
+        uint256 collateralChanged,
+        uint256 sizeChanged,
+        Side side,
+        uint256 indexPrice,
+        SignedInt pnl,
+        uint256 feeValue,
+        DecreaseType decreaseType
     );
 
     // ========= Error ===============
