@@ -1,0 +1,68 @@
+{
+  "format": 1,
+  "restore": {
+    "/Users/deedee/Desktop/fdex-capstone/fdex-trading-contract/FdexTradingContract.Contracts.csproj": {}
+  },
+  "projects": {
+    "/Users/deedee/Desktop/fdex-capstone/fdex-trading-contract/FdexTradingContract.Contracts.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/Users/deedee/Desktop/fdex-capstone/fdex-trading-contract/FdexTradingContract.Contracts.csproj",
+        "projectName": "FdexTradingContract.Contracts",
+        "projectPath": "/Users/deedee/Desktop/fdex-capstone/fdex-trading-contract/FdexTradingContract.Contracts.csproj",
+        "packagesPath": "/Users/deedee/.nuget/packages/",
+        "outputPath": "/Users/deedee/Desktop/fdex-capstone/fdex-trading-contract/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/Users/deedee/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "netstandard2.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "netstandard2.0": {
+            "targetAlias": "netstandard2.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "netstandard2.0": {
+          "targetAlias": "netstandard2.0",
+          "dependencies": {
+            "NETStandard.Library": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[2.0.3, )",
+              "autoReferenced": true
+            },
+            "Nethereum.Web3": {
+              "target": "Package",
+              "version": "[4.*, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "runtimeIdentifierGraphPath": "/usr/local/share/dotnet/sdk/7.0.203/RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

@@ -84,20 +84,20 @@ contract OrderManager is Ownable {
         Side _side,
         address _indexToken,
         address _collateralToken,
-        uint256 _collateral,
+        uint256 _collateralAmount,
         uint256 _sizeChange,
         uint256 _price,
         OrderType _orderType
     ) external payable {
-        require(pool.isAsset(_indexToken), "OrderManager:invalidTokens");
+        require(pool.isAsset(_indexToken) && pool.isAsset(_collateralToken), "OrderManager:invalidTokens");
         address payToken;
         (payToken, _collateralToken) =
             _collateralToken == ETH ? (ETH, address(weth)) : (_collateralToken, _collateralToken);
         if (_poisitionType == PositionType.INCREASE) {
             if (payToken == ETH) {
-                weth.deposit{value: _collateral}();
+                weth.deposit{value: _collateralAmount}();
             } else {
-                IERC20(_collateralToken).safeTransferFrom(msg.sender, address(this), _collateral);
+                IERC20(_collateralToken).safeTransferFrom(msg.sender, address(this), _collateralAmount);
             }
         }
         uint256 orderId;
@@ -105,7 +105,7 @@ contract OrderManager is Ownable {
         order.owner = msg.sender;
         order.indexToken = _indexToken;
         order.collateralToken = _collateralToken;
-        order.collateralAmount = _collateral;
+        order.collateralAmount = _collateralAmount;
         order.sizeChange = _sizeChange;
         order.expiresAt = _orderType == OrderType.MARKET ? block.timestamp + MARKET_ORDER_TIMEOUT : 0;
         order.submissionBlock = block.number;
@@ -124,24 +124,24 @@ contract OrderManager is Ownable {
         emit OrderPlaced(orderId, order);
     }
 
-    function executeOrder(uint256 _orderId, address payable _feeTo) external {
+    function executeOrder(uint256 _orderId) external {
         Order memory order = orders[_orderId];
-        require(order.owner != address(0), "OrderManager:orderNotExists");
         require(block.number > order.submissionBlock, "OrderManager:blockNotPass");
+        require(order.owner != address(0), "OrderManager:orderNotExists");
         if (order.expiresAt != 0 && order.expiresAt < block.timestamp) {
             _expiresOrder(_orderId);
             return;
         }
-        uint256 indexPrice = _getMarkPrice(order);
+        uint256 indexPrice = oracle.getPrice(order.indexToken);
         bool isValidPrice = order.orderType == OrderType.LIMIT
             ? order.side == Side.LONG ? indexPrice <= order.price : indexPrice >= order.price
-            : true;
+            : true;   
         if (!isValidPrice) {
             return;
         }
         _executeRequest(_orderId);
         delete orders[_orderId];
-        _safeTransferETH(_feeTo, order.executionFee);
+        _safeTransferETH(msg.sender, order.executionFee);
         emit OrderExecuted(_orderId, order, indexPrice);
     }
 
@@ -179,10 +179,6 @@ contract OrderManager is Ownable {
                 collateralToken.safeTransfer(_order.owner, payoutAmount);
             }
         }
-    }
-
-    function _getMarkPrice(Order memory order) internal view returns (uint256) {
-        return oracle.getPrice(order.indexToken);
     }
 
     function _expiresOrder(uint256 _orderId) internal {

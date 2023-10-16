@@ -118,11 +118,11 @@ contract Poolz is Test {
 
     function executeOrderByReposter(uint256 id) public {
         vm.startBroadcast(address(deployper));
-        orderManager.executeOrder(id, payable(address(deployper)));
+        orderManager.executeOrder(id);
         vm.stopBroadcast();
     }
 
-    function monitorBalance() public {
+    function monitorBalance() public view {
         console.log("==== Monitor Balance ====");
         console.log("balance btc :", btc.balanceOf(mike));
         console.log("balance eth :", eth.balanceOf(mike));
@@ -137,67 +137,77 @@ contract Poolz is Test {
         // mike
         vm.startBroadcast(mike);
         vm.roll(1);
-        usdc.mint(50 * 1e6);
+        usdc.mint(100 * 1e6);
         vm.deal(mike, 1e18);
-        usdc.approve(address(orderManager), usdc.balanceOf(mike));
+        usdc.approve(address(orderManager), type(uint256).max);
 
         monitorBalance();
 
         orderManager.placeOrder{value: 1e16}(
-            PositionType.INCREASE, Side.LONG, address(btc), address(usdc), 50e6, 100e30, 25_000e8, OrderType.MARKET
+            PositionType.INCREASE, Side.LONG, address(btc), address(usdc), 50e6, 100e30, 25_500e22, OrderType.LIMIT
         );
-        vm.stopBroadcast();
+           vm.stopBroadcast();
         vm.roll(2);
-        executeOrderByReposter(1);
-        vm.roll(3);
-        priceChange(14_500e8, 1700e8, 220e8, 1e8);
-
-        vm.roll(4);
+       executeOrderByReposter(1);
+          priceChange(28_500e8, 1700e8, 220e8, 1e8);
+         vm.roll(3);
         vm.startBroadcast(mike);
         orderManager.placeOrder{value: 1e16}(
-            PositionType.DECREASE, Side.LONG, address(btc), address(usdc), 50e6, 100e30, 0, OrderType.MARKET
+            PositionType.INCREASE, Side.LONG, address(btc), address(usdc), 50e6, 100e30, 0, OrderType.MARKET
+        );
+         vm.stopBroadcast();
+        vm.roll(4);
+        priceChange(30_500e8, 1700e8, 220e8, 1e8);
+        executeOrderByReposter(2);
+        vm.roll(5);
+
+
+        vm.roll(6);
+        vm.startBroadcast(mike);
+        orderManager.placeOrder{value: 1e16}(
+            PositionType.DECREASE, Side.LONG, address(btc), address(usdc), 100e6, 200e30, 0, OrderType.MARKET
         );
         vm.stopBroadcast();
 
-        vm.roll(5);
-        executeOrderByReposter(2);
+        vm.roll(7);
+        executeOrderByReposter(3);
 
-        vm.roll(6);
+        vm.roll(8);
         monitorBalance();
         // console.log("balance usdc orderManager:", usdc.balanceOf(address(orderManager)));
         // console.log("balance usdc pool :", usdc.balanceOf(address(pool)));
     }
 
-    function testLiquidationPosition() public {
-        addLiquidity();
+    // function testLiquidationPosition() public {
+    //     addLiquidity();
 
-        // mike
-        vm.startBroadcast(mike);
-        vm.roll(1);
-        usdc.mint(50 * 1e6);
-        vm.deal(mike, 1e18);
-        usdc.approve(address(orderManager), usdc.balanceOf(mike));
+    //     // mike
+    //     vm.startBroadcast(mike);
+    //     vm.roll(1);
+    //     usdc.mint(50 * 1e6);
+    //     vm.deal(mike, 1e18);
+    //     usdc.approve(address(orderManager), usdc.balanceOf(mike));
 
-        monitorBalance();
+    //     monitorBalance();
 
-        orderManager.placeOrder{value: 1e16}(
-            PositionType.INCREASE, Side.LONG, address(btc), address(usdc), 50e6, 100e30, 25_000e8, OrderType.MARKET
-        );
-        vm.stopBroadcast();
-        vm.roll(2);
-        executeOrderByReposter(1);
-        vm.roll(3);
-        priceChange(13_600e8, 1700e8, 220e8, 1e8);
+    //     orderManager.placeOrder{value: 1e16}(
+    //         PositionType.INCREASE, Side.LONG, address(btc), address(usdc), 50e6, 100e30, 25_000e8, OrderType.MARKET
+    //     );
+    //     vm.stopBroadcast();
+    //     vm.roll(2);
+    //     executeOrderByReposter(1);
+    //     vm.roll(3);
+    //     priceChange(13_600e8, 1700e8, 220e8, 1e8);
 
-        vm.roll(4);
+    //     vm.roll(4);
 
-        vm.startBroadcast(address(deployper));
-        uint256 a = usdc.balanceOf(address(deployper));
-        pool.liquidatePosition(mike, address(btc), address(usdc), Side.LONG);
-        console.log("balance usdc deployper earn:", usdc.balanceOf(address(deployper)) - a);
-        vm.stopBroadcast();
-        monitorBalance();
-    }
+    //     vm.startBroadcast(address(deployper));
+    //     uint256 a = usdc.balanceOf(address(deployper));
+    //     pool.liquidatePosition(mike, address(btc), address(usdc), Side.LONG);
+    //     console.log("balance usdc deployper earn:", usdc.balanceOf(address(deployper)) - a);
+    //     vm.stopBroadcast();
+    //     monitorBalance();
+    // }
 
     // function testRemoveLiquidity() public {
     //     addLiquidity();
